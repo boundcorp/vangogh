@@ -248,10 +248,13 @@ def engine_is_on():
 # =============================================================================
 
 def read_gps(timeout=3000):
-    """Read GPS data with restored working configuration"""
+    """Read GPS data using simple readline approach"""
     try:
         start_time = time.ticks_ms()
         gps_data = {"gps_fix_valid": False, "satellites": 0}
+        lines_processed = 0
+        gprmc_found = False
+        gpgga_found = False
         
         while time.ticks_diff(time.ticks_ms(), start_time) < timeout:
             line = gps_uart.readline()
@@ -259,81 +262,90 @@ def read_gps(timeout=3000):
                 try:
                     line_str = line.decode('ascii').strip()
                     
-                    # Parse GPRMC for position, speed, time
-                    if line_str.startswith('$GPRMC') or line_str.startswith('$GNRMC'):
-                        parts = line_str.split(',')
-                        if len(parts) >= 13:
-                            time_str = parts[1]
-                            status = parts[2]
-                            lat_str = parts[3]
-                            lat_dir = parts[4]
-                            lon_str = parts[5]
-                            lon_dir = parts[6]
-                            speed_str = parts[7]
-                            date_str = parts[9]
-                            
-                            if status == 'A' and lat_str and lon_str:  # Valid fix with coordinates
-                                # Convert coordinates
-                                lat = float(lat_str[:2]) + float(lat_str[2:]) / 60.0
-                                if lat_dir == 'S': lat = -lat
-                                
-                                lon = float(lon_str[:3]) + float(lon_str[3:]) / 60.0
-                                if lon_dir == 'W': lon = -lon
-                                
-                                # Handle speed with noise filtering
-                                speed = 0.0
-                                if speed_str:
-                                    speed_knots = float(speed_str)
-                                    speed_kmh = speed_knots * 1.852
-                                    # Filter out GPS noise - speeds under 1 km/h when "stationary"
-                                    speed = speed_kmh if speed_kmh > 1.0 else 0.0
-                                
-                                # Parse time more carefully
-                                time_formatted = "??:??:??"
-                                if time_str and len(time_str) >= 6:
-                                    try:
-                                        time_formatted = f"{time_str[:2]}:{time_str[2:4]}:{time_str[4:6]}"
-                                    except:
-                                        time_formatted = "??:??:??"
-                                
-                                gps_data.update({
-                                    "gps_fix_valid": True,
-                                    "latitude": lat,
-                                    "longitude": lon,
-                                    "speed": speed,
-                                    "time": time_formatted
-                                })
-                    
-                    # Parse GPGGA for satellite count and altitude
-                    elif line_str.startswith('$GPGGA') or line_str.startswith('$GNGGA'):
-                        parts = line_str.split(',')
-                        if len(parts) >= 15:
-                            quality = parts[6]  # Fix quality: 0=invalid, 1=GPS fix, 2=DGPS fix
-                            satellites = parts[7]  # Number of satellites
-                            altitude = parts[9]  # Altitude above sea level
-                            
-                            if quality in ['1', '2'] and satellites:
-                                try:
-                                    sat_count = int(satellites)
-                                    gps_data["satellites"] = sat_count
-                                    if altitude:
-                                        gps_data["altitude"] = float(altitude)
-                                except ValueError:
-                                    pass
-                    
-                    # Return early if we have both position and satellite data
-                    if gps_data.get("gps_fix_valid") and gps_data.get("satellites", 0) > 0:
-                        return gps_data
+                    if line_str.startswith('$'):
+                        lines_processed += 1
                         
-                except (ValueError, IndexError, UnicodeDecodeError):
+                        # Parse GPRMC for position, speed, time
+                        if line_str.startswith(('$GPRMC', '$GNRMC')):
+                            parts = line_str.split(',')
+                            if len(parts) >= 13:
+                                time_str = parts[1]
+                                status = parts[2]
+                                lat_str = parts[3]
+                                lat_dir = parts[4]
+                                lon_str = parts[5]
+                                lon_dir = parts[6]
+                                speed_str = parts[7]
+                                
+                                if status == 'A' and lat_str and lon_str:
+                                    try:
+                                        # Parse coordinates
+                                        if len(lat_str) >= 4 and len(lon_str) >= 5:
+                                            lat = float(lat_str[:2]) + float(lat_str[2:]) / 60.0
+                                            if lat_dir == 'S': 
+                                                lat = -lat
+                                            
+                                            lon = float(lon_str[:3]) + float(lon_str[3:]) / 60.0
+                                            if lon_dir == 'W': 
+                                                lon = -lon
+                                            
+                                            # Parse speed
+                                            speed = 0.0
+                                            if speed_str:
+                                                speed_knots = float(speed_str)
+                                                speed_kmh = speed_knots * 1.852
+                                                speed = speed_kmh if speed_kmh > 1.0 else 0.0
+                                            
+                                            # Parse time
+                                            time_formatted = "??:??:??"
+                                            if time_str and len(time_str) >= 6:
+                                                time_formatted = f"{time_str[:2]}:{time_str[2:4]}:{time_str[4:6]}"
+                                            
+                                            gps_data.update({
+                                                "gps_fix_valid": True,
+                                                "latitude": lat,
+                                                "longitude": lon,
+                                                "speed": speed,
+                                                "time": time_formatted
+                                            })
+                                            gprmc_found = True
+                                    except (ValueError, IndexError):
+                                        continue
+                        
+                        # Parse GPGGA for satellite count
+                        elif line_str.startswith(('$GPGGA', '$GNGGA')):
+                            parts = line_str.split(',')
+                            if len(parts) >= 8:  # Reduced requirement for fragmented sentences
+                                try:
+                                    satellites = parts[7] if len(parts) > 7 else ""
+                                    if satellites and satellites.isdigit():
+                                        sat_count = int(satellites)
+                                        gps_data["satellites"] = sat_count
+                                        gpgga_found = True
+                                except (ValueError, IndexError):
+                                    continue
+                        
+                        # Return early if we have both types of data
+                        if gprmc_found and gpgga_found:
+                            return gps_data
+                            
+                except:
                     continue
+            else:
+                time.sleep(0.01)
         
-        # Return whatever we collected, even if incomplete
+        # Debug output
+        if lines_processed == 0:
+            print("GPS: No valid NMEA sentences received")
+        else:
+            print(f"GPS: Processed {lines_processed} lines, fix={gps_data.get('gps_fix_valid')}, sats={gps_data.get('satellites', 0)}")
+        
         return gps_data
         
     except Exception as e:
         print(f"GPS read error: {e}")
         return {"gps_fix_valid": False, "satellites": 0, "error": str(e)}
+
 
 # =============================================================================
 # BATTERY FUNCTIONS
@@ -426,7 +438,14 @@ def update_sensors():
     
     # Read GPS
     sensor_data["gps"] = read_gps()
-    print(f"GPS: {'Fix' if sensor_data['gps'].get('gps_fix_valid') else 'No fix'}")
+    gps_result = sensor_data["gps"]
+    if gps_result.get('gps_fix_valid'):
+        sat_count = gps_result.get('satellites', 0)
+        gps_time = gps_result.get('time', '??:??:??')
+        print(f"GPS: Fix - SAT:{sat_count} TIME:{gps_time}")
+    else:
+        print("GPS: No fix")
+        print(f"Debug: GPS returned {gps_result}")
     
     # Show home status if GPS valid
     if sensor_data["gps"].get('gps_fix_valid'):
